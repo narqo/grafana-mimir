@@ -352,7 +352,7 @@ func (s *splitAndCacheMiddleware) fetchCacheExtents(ctx context.Context, now tim
 
 	// Lookup the cache.
 	s.metrics.cacheRequests.Add(float64(len(keys)))
-	founds := s.cache.Fetch(ctx, hashedKeys)
+	founds := s.cache.GetMulti(ctx, hashedKeys)
 	s.metrics.cacheHits.Add(float64(len(founds)))
 
 	// Decode all cached responses.
@@ -455,7 +455,7 @@ func (s *splitAndCacheMiddleware) storeCacheExtents(key string, tenantIDs []stri
 		return
 	}
 
-	s.cache.StoreAsync(map[string][]byte{cacheHashKey(key): buf}, usedTTL)
+	s.cache.SetMultiAsync(map[string][]byte{cacheHashKey(key): buf}, usedTTL)
 }
 
 func getTTLForExtent(now time.Time, ttl, ttlInOOOWindow, oooWindow time.Duration, e Extent) time.Duration {
@@ -667,14 +667,23 @@ func evaluateAtModifierFunction(query string, start, end int64) (string, error) 
 		return "", apierror.New(apierror.TypeBadData, decorateWithParamName(err, "query").Error())
 	}
 	parser.Inspect(expr, func(n parser.Node, _ []parser.Node) error {
-		if selector, ok := n.(*parser.VectorSelector); ok {
-			switch selector.StartOrEnd {
+		switch exprAt := n.(type) {
+		case *parser.VectorSelector:
+			switch exprAt.StartOrEnd {
 			case parser.START:
-				selector.Timestamp = &start
+				exprAt.Timestamp = &start
 			case parser.END:
-				selector.Timestamp = &end
+				exprAt.Timestamp = &end
 			}
-			selector.StartOrEnd = 0
+			exprAt.StartOrEnd = 0
+		case *parser.SubqueryExpr:
+			switch exprAt.StartOrEnd {
+			case parser.START:
+				exprAt.Timestamp = &start
+			case parser.END:
+				exprAt.Timestamp = &end
+			}
+			exprAt.StartOrEnd = 0
 		}
 		return nil
 	})

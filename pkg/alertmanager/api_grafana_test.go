@@ -32,6 +32,26 @@ const (
 				"receiver": "test_receiver",
 				"group_by": ["alertname"]
 			},
+			"global": {
+				"http_config": {
+					"enable_http2": true,
+					"follow_redirects": true,
+					"proxy_url": null,
+					"tls_config": {
+						"insecure_skip_verify": true
+					}
+				},
+				"opsgenie_api_url": "https://api.opsgenie.com/",
+				"pagerduty_url": "https://events.pagerduty.com/v2/enqueue",
+				"resolve_timeout": "5m",
+				"smtp_hello": "localhost",
+				"smtp_require_tls": true,
+				"smtp_smarthost": "",
+				"telegram_api_url": "https://api.telegram.org",
+				"victorops_api_url": "https://alert.victorops.com/integrations/generic/20131114/alert/",
+				"webex_api_url": "https://webexapis.com/v1/messages",
+				"wechat_api_url": "https://qyapi.weixin.qq.com/cgi-bin/"
+			},
 			"receivers": [{
 				"name": "test_receiver",
 				"grafana_managed_receiver_configs": [{
@@ -41,11 +61,9 @@ const (
 					"disableResolveMessage": true,
 					"settings": {
 						"addresses": "test@test.com"
-					},
-					"secureSettings": null
+					}
 				}]
-			}],
-			"templates": null
+			}]
 		}
 	}`
 )
@@ -212,7 +230,8 @@ func TestMultitenantAlertmanager_GetUserGrafanaConfig(t *testing.T) {
 				 "configuration": %s,
 				 "configuration_hash": "bb788eaa294c05ec556c1ed87546b7a9",
 				 "created": %d,
-				 "default": false
+				 "default": false,
+				 "promoted": false
 			},
 			"status": "success"
 		}
@@ -326,7 +345,8 @@ func TestMultitenantAlertmanager_SetUserGrafanaConfig(t *testing.T) {
 			"configuration": %s,
 			"configuration_hash": "ChEKBW5mbG9nEghzb21lZGF0YQ==",
 			"created": 12312414343,
-			"default": false
+			"default": false,
+			"promoted": true
 		}
 		`, testGrafanaConfig)
 		req.Body = io.NopCloser(strings.NewReader(json))

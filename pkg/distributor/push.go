@@ -6,7 +6,6 @@
 package distributor
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -14,15 +13,18 @@ import (
 	"math/rand"
 	"net/http"
 	"strconv"
-	"sync"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
+	"github.com/grafana/dskit/grpcutil"
 	"github.com/grafana/dskit/httpgrpc"
 	"github.com/grafana/dskit/httpgrpc/server"
 	"github.com/grafana/dskit/middleware"
 	"github.com/grafana/dskit/tenant"
 	"github.com/opentracing/opentracing-go"
+	"google.golang.org/grpc/codes"
+	grpcstatus "google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/grafana/mimir/pkg/mimirpb"
 	"github.com/grafana/mimir/pkg/util"
@@ -38,11 +40,6 @@ type PushFunc func(ctx context.Context, req *Request) error
 type parserFunc func(ctx context.Context, r *http.Request, maxSize int, buffers *util.RequestBuffers, req *mimirpb.PreallocWriteRequest, logger log.Logger) error
 
 var (
-	bufferPool = sync.Pool{
-		New: func() any {
-			return bytes.NewBuffer(make([]byte, 0, 256*1024))
-		},
-	}
 	errRetryBaseLessThanOneSecond    = errors.New("retry base duration should not be less than 1 second")
 	errNonPositiveMaxBackoffExponent = errors.New("max backoff exponent should be a positive value")
 )
@@ -78,19 +75,30 @@ func (cfg *RetryConfig) Validate() error {
 // Handler is a http.Handler which accepts WriteRequests.
 func Handler(
 	maxRecvMsgSize int,
+	requestBufferPool util.Pool,
 	sourceIPs *middleware.SourceIPExtractor,
 	allowSkipLabelNameValidation bool,
 	limits *validation.Overrides,
 	retryCfg RetryConfig,
 	push PushFunc,
+	pushMetrics *PushMetrics,
 	logger log.Logger,
 ) http.Handler {
-	return handler(maxRecvMsgSize, sourceIPs, allowSkipLabelNameValidation, limits, retryCfg, push, logger, func(ctx context.Context, r *http.Request, maxRecvMsgSize int, buffers *util.RequestBuffers, req *mimirpb.PreallocWriteRequest, _ log.Logger) error {
-		err := util.ParseProtoReader(ctx, r.Body, int(r.ContentLength), maxRecvMsgSize, buffers, req, util.RawSnappy)
+	return handler(maxRecvMsgSize, requestBufferPool, sourceIPs, allowSkipLabelNameValidation, limits, retryCfg, push, logger, func(ctx context.Context, r *http.Request, maxRecvMsgSize int, buffers *util.RequestBuffers, req *mimirpb.PreallocWriteRequest, _ log.Logger) error {
+		protoBodySize, err := util.ParseProtoReader(ctx, r.Body, int(r.ContentLength), maxRecvMsgSize, buffers, req, util.RawSnappy)
 		if errors.Is(err, util.MsgSizeTooLargeErr{}) {
 			err = distributorMaxWriteMessageSizeErr{actual: int(r.ContentLength), limit: maxRecvMsgSize}
 		}
-		return err
+		if err != nil {
+			return err
+		}
+		tenantID, err := tenant.TenantID(ctx)
+		if err != nil {
+			return err
+		}
+		pushMetrics.ObserveUncompressedBodySize(tenantID, float64(protoBodySize))
+
+		return nil
 	})
 }
 
@@ -108,6 +116,7 @@ func (e distributorMaxWriteMessageSizeErr) Error() string {
 
 func handler(
 	maxRecvMsgSize int,
+	requestBufferPool util.Pool,
 	sourceIPs *middleware.SourceIPExtractor,
 	allowSkipLabelNameValidation bool,
 	limits *validation.Overrides,
@@ -126,7 +135,7 @@ func handler(
 			}
 		}
 		supplier := func() (*mimirpb.WriteRequest, func(), error) {
-			rb := util.NewRequestBuffers(&bufferPool)
+			rb := util.NewRequestBuffers(requestBufferPool)
 			var req mimirpb.PreallocWriteRequest
 			if err := parser(ctx, r, maxRecvMsgSize, rb, &req, logger); err != nil {
 				// Check for httpgrpc error, default to client error if parsing failed
@@ -164,15 +173,116 @@ func handler(
 			if resp, ok := httpgrpc.HTTPResponseFromError(err); ok {
 				code, msg = int(resp.Code), string(resp.Body)
 			} else {
-				code, msg = toHTTPStatus(ctx, err, limits), err.Error()
+				_, code = toGRPCHTTPStatus(ctx, err, limits)
+				msg = err.Error()
 			}
 			if code != 202 {
-				level.Error(logger).Log("msg", "push error", "err", err)
+				// This error message is consistent with error message in OTLP handler, and ingester's ingest-storage pushToStorage method.
+				msgs := []interface{}{"msg", "detected an error while ingesting Prometheus remote-write request (the request may have been partially ingested)", "httpCode", code, "err", err}
+				if code/100 == 4 {
+					msgs = append(msgs, "insight", true)
+				}
+				level.Error(logger).Log(msgs...)
 			}
 			addHeaders(w, err, r, code, retryCfg)
 			http.Error(w, msg, code)
 		}
 	})
+}
+
+func otlpHandler(
+	maxRecvMsgSize int,
+	requestBufferPool util.Pool,
+	sourceIPs *middleware.SourceIPExtractor,
+	limits *validation.Overrides,
+	retryCfg RetryConfig,
+	push PushFunc,
+	logger log.Logger,
+	parser parserFunc,
+) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
+		logger := utillog.WithContext(ctx, logger)
+		if sourceIPs != nil {
+			source := sourceIPs.Get(r)
+			if source != "" {
+				logger = utillog.WithSourceIPs(source, logger)
+			}
+		}
+		supplier := func() (*mimirpb.WriteRequest, func(), error) {
+			rb := util.NewRequestBuffers(requestBufferPool)
+			var req mimirpb.PreallocWriteRequest
+			if err := parser(ctx, r, maxRecvMsgSize, rb, &req, logger); err != nil {
+				// Check for httpgrpc error, default to client error if parsing failed
+				if _, ok := httpgrpc.HTTPResponseFromError(err); !ok {
+					err = httpgrpc.Errorf(http.StatusBadRequest, err.Error())
+				}
+
+				rb.CleanUp()
+				return nil, nil, err
+			}
+
+			cleanup := func() {
+				mimirpb.ReuseSlice(req.Timeseries)
+				rb.CleanUp()
+			}
+			return &req.WriteRequest, cleanup, nil
+		}
+		req := newRequest(supplier)
+		if err := push(ctx, req); err != nil {
+			if errors.Is(err, context.Canceled) {
+				level.Warn(logger).Log("msg", "push request canceled", "err", err)
+				writeErrorToHTTPResponseBody(w, statusClientClosedRequest, codes.Canceled, "push request context canceled", logger)
+				return
+			}
+			var (
+				httpCode int
+				grpcCode codes.Code
+				errorMsg string
+			)
+			if resp, ok := httpgrpc.HTTPResponseFromError(err); ok {
+				// here the error would always be nil, since it is already checked in httpgrpc.HTTPResponseFromError
+				s, _ := grpcutil.ErrorToStatus(err)
+				httpCode = int(resp.Code)
+				grpcCode = s.Code() // this will be the same as httpCode.
+				errorMsg = string(resp.Body)
+			} else {
+				grpcCode, httpCode = toGRPCHTTPStatus(ctx, err, limits)
+				errorMsg = err.Error()
+			}
+			if httpCode != 202 {
+				// This error message is consistent with error message in Prometheus remote-write handler, and ingester's ingest-storage pushToStorage method.
+				msgs := []interface{}{"msg", "detected an error while ingesting OTLP metrics request (the request may have been partially ingested)", "httpCode", httpCode, "err", err}
+				if httpCode/100 == 4 {
+					msgs = append(msgs, "insight", true)
+				}
+				level.Error(logger).Log(msgs...)
+			}
+			addHeaders(w, err, r, httpCode, retryCfg)
+			writeErrorToHTTPResponseBody(w, httpCode, grpcCode, errorMsg, logger)
+		}
+	})
+}
+
+// writeErrorToHTTPResponseBody converts the given error into a grpc status and marshals it into a byte slice, in order to be written to the response body.
+// See doc https://opentelemetry.io/docs/specs/otlp/#failures-1
+func writeErrorToHTTPResponseBody(w http.ResponseWriter, httpCode int, grpcCode codes.Code, msg string, logger log.Logger) {
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(httpCode)
+
+	respBytes, err := proto.Marshal(grpcstatus.New(grpcCode, msg).Proto())
+	if err != nil {
+		level.Error(logger).Log("msg", "otlp response marshal failed", "err", err)
+		writeResponseFailedBody, _ := proto.Marshal(grpcstatus.New(codes.Internal, "failed to marshal OTLP response").Proto())
+		_, _ = w.Write(writeResponseFailedBody)
+		return
+	}
+
+	_, err = w.Write(respBytes)
+	if err != nil {
+		level.Error(logger).Log("msg", "write error to otlp response failed", "err", err)
+	}
 }
 
 func calculateRetryAfter(retryAttemptHeader string, baseSeconds int, maxBackoffExponent int) string {
@@ -193,19 +303,19 @@ func calculateRetryAfter(retryAttemptHeader string, baseSeconds int, maxBackoffE
 	return strconv.FormatInt(delaySeconds, 10)
 }
 
-// toHTTPStatus converts the given error into an appropriate HTTP status corresponding
-// to that error, if the error is one of the errors from this package. Otherwise, an
+// toGRPCHTTPStatus converts the given error into an appropriate GRPC and HTTP status corresponding
+// to that error, if the error is one of the errors from this package. Otherwise, codes.Internal and
 // http.StatusInternalServerError is returned.
-func toHTTPStatus(ctx context.Context, pushErr error, limits *validation.Overrides) int {
+func toGRPCHTTPStatus(ctx context.Context, pushErr error, limits *validation.Overrides) (codes.Code, int) {
 	if errors.Is(pushErr, context.DeadlineExceeded) {
-		return http.StatusInternalServerError
+		return codes.Internal, http.StatusInternalServerError
 	}
 
-	var distributorErr distributorError
+	var distributorErr Error
 	if errors.As(pushErr, &distributorErr) {
-		switch distributorErr.errorCause() {
+		switch distributorErr.Cause() {
 		case mimirpb.BAD_DATA:
-			return http.StatusBadRequest
+			return codes.InvalidArgument, http.StatusBadRequest
 		case mimirpb.INGESTION_RATE_LIMITED, mimirpb.REQUEST_RATE_LIMITED:
 			serviceOverloadErrorEnabled := false
 			userID, err := tenant.TenantID(ctx)
@@ -216,24 +326,24 @@ func toHTTPStatus(ctx context.Context, pushErr error, limits *validation.Overrid
 			// Client may discard the data or slow down and re-send.
 			// Prometheus v2.26 added a remote-write option 'retry_on_http_429'.
 			if serviceOverloadErrorEnabled {
-				return StatusServiceOverloaded
+				return codes.ResourceExhausted, StatusServiceOverloaded
 			}
-			return http.StatusTooManyRequests
+			return codes.ResourceExhausted, http.StatusTooManyRequests
 		case mimirpb.REPLICAS_DID_NOT_MATCH:
-			return http.StatusAccepted
+			return codes.OK, http.StatusAccepted
 		case mimirpb.TOO_MANY_CLUSTERS:
-			return http.StatusBadRequest
+			return codes.InvalidArgument, http.StatusBadRequest
 		case mimirpb.TSDB_UNAVAILABLE:
-			return http.StatusServiceUnavailable
+			return codes.Unavailable, http.StatusServiceUnavailable
 		case mimirpb.CIRCUIT_BREAKER_OPEN:
-			return http.StatusServiceUnavailable
+			return codes.Unavailable, http.StatusServiceUnavailable
 		case mimirpb.METHOD_NOT_ALLOWED:
 			// Return a 501 (and not 405) to explicitly signal a misconfiguration and to possibly track that amongst other 5xx errors.
-			return http.StatusNotImplemented
+			return codes.Unimplemented, http.StatusNotImplemented
 		}
 	}
 
-	return http.StatusInternalServerError
+	return codes.Internal, http.StatusInternalServerError
 }
 
 func addHeaders(w http.ResponseWriter, err error, r *http.Request, responseCode int, retryCfg RetryConfig) {
